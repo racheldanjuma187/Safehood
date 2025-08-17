@@ -12,6 +12,11 @@
 (define-constant ERR_INVALID_LEVEL (err u110))
 (define-constant ERR_ALREADY_CLAIMED (err u111))
 (define-constant ERR_NO_REWARDS_AVAILABLE (err u112))
+(define-constant ERR_ALERT_NOT_FOUND (err u113))
+(define-constant ERR_ALREADY_RESPONDED (err u114))
+(define-constant ERR_ALERT_RESOLVED (err u115))
+(define-constant ERR_INVALID_SEVERITY (err u116))
+(define-constant ERR_INVALID_ZONE (err u117))
 
 (define-data-var proposal-counter uint u0)
 (define-data-var total-treasury uint u0)
@@ -79,6 +84,39 @@
 
 (define-map reputation-claims {member: principal, month: uint} bool)
 (define-data-var current-month uint u1)
+
+(define-data-var alert-counter uint u0)
+
+(define-map emergency-alerts uint {
+    id: uint,
+    creator: principal,
+    title: (string-ascii 100),
+    description: (string-ascii 400),
+    severity: uint,
+    zone: (string-ascii 50),
+    location: (string-ascii 100),
+    timestamp: uint,
+    resolved: bool,
+    responder-count: uint,
+    acknowledgment-count: uint,
+    verified: bool
+})
+
+(define-map alert-responses {alert-id: uint, responder: principal} {
+    response-type: uint,
+    timestamp: uint,
+    response-note: (string-ascii 200),
+    arrived-on-scene: bool
+})
+
+(define-map alert-acknowledgments {alert-id: uint, member: principal} uint)
+
+(define-map safety-zones (string-ascii 50) {
+    zone-name: (string-ascii 50),
+    description: (string-ascii 200),
+    priority-level: uint,
+    active: bool
+})
 
 (define-public (join-dao)
     (begin
@@ -429,3 +467,216 @@
 (define-read-only (has-claimed-monthly-reward (member principal) (month uint))
     (default-to false (map-get? reputation-claims {member: member, month: month}))
 )
+
+(define-public (initialize-safety-zones)
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (map-set safety-zones "RESIDENTIAL" {zone-name: "RESIDENTIAL", description: "Residential neighborhood areas", priority-level: u2, active: true})
+        (map-set safety-zones "COMMERCIAL" {zone-name: "COMMERCIAL", description: "Commercial district areas", priority-level: u3, active: true})
+        (map-set safety-zones "PARK" {zone-name: "PARK", description: "Public parks and recreation areas", priority-level: u1, active: true})
+        (map-set safety-zones "SCHOOL" {zone-name: "SCHOOL", description: "School zones and educational facilities", priority-level: u4, active: true})
+        (map-set safety-zones "EMERGENCY" {zone-name: "EMERGENCY", description: "Critical emergency response areas", priority-level: u5, active: true})
+        (ok true)
+    )
+)
+
+(define-public (create-emergency-alert (title (string-ascii 100)) (description (string-ascii 400)) 
+                                      (severity uint) (zone (string-ascii 50)) (location (string-ascii 100)))
+    (let ((alert-id (+ (var-get alert-counter) u1))
+          (zone-info (map-get? safety-zones zone)))
+        (asserts! (is-some (map-get? members tx-sender)) ERR_NOT_MEMBER)
+        (asserts! (and (>= severity u1) (<= severity u5)) ERR_INVALID_SEVERITY)
+        (asserts! (is-some zone-info) ERR_INVALID_ZONE)
+        (asserts! (get active (unwrap-panic zone-info)) ERR_INVALID_ZONE)
+        
+        (map-set emergency-alerts alert-id {
+            id: alert-id,
+            creator: tx-sender,
+            title: title,
+            description: description,
+            severity: severity,
+            zone: zone,
+            location: location,
+            timestamp: stacks-block-height,
+            resolved: false,
+            responder-count: u0,
+            acknowledgment-count: u0,
+            verified: false
+        })
+        (var-set alert-counter alert-id)
+        (ok alert-id)
+    )
+)
+
+(define-public (acknowledge-alert (alert-id uint))
+    (let ((alert (unwrap! (map-get? emergency-alerts alert-id) ERR_ALERT_NOT_FOUND))
+          (existing-ack (map-get? alert-acknowledgments {alert-id: alert-id, member: tx-sender})))
+        (asserts! (is-some (map-get? members tx-sender)) ERR_NOT_MEMBER)
+        (asserts! (not (get resolved alert)) ERR_ALERT_RESOLVED)
+        (asserts! (is-none existing-ack) ERR_ALREADY_RESPONDED)
+        
+        (map-set alert-acknowledgments {alert-id: alert-id, member: tx-sender} stacks-block-height)
+        (map-set emergency-alerts alert-id (merge alert {acknowledgment-count: (+ (get acknowledgment-count alert) u1)}))
+        (ok true)
+    )
+)
+
+(define-public (respond-to-alert (alert-id uint) (response-type uint) (response-note (string-ascii 200)))
+    (let ((alert (unwrap! (map-get? emergency-alerts alert-id) ERR_ALERT_NOT_FOUND))
+          (existing-response (map-get? alert-responses {alert-id: alert-id, responder: tx-sender})))
+        (asserts! (is-some (map-get? members tx-sender)) ERR_NOT_MEMBER)
+        (asserts! (not (get resolved alert)) ERR_ALERT_RESOLVED)
+        (asserts! (is-none existing-response) ERR_ALREADY_RESPONDED)
+        (asserts! (and (>= response-type u1) (<= response-type u4)) ERR_INVALID_AMOUNT)
+        
+        (map-set alert-responses {alert-id: alert-id, responder: tx-sender} {
+            response-type: response-type,
+            timestamp: stacks-block-height,
+            response-note: response-note,
+            arrived-on-scene: false
+        })
+        (map-set emergency-alerts alert-id (merge alert {responder-count: (+ (get responder-count alert) u1)}))
+        (ok true)
+    )
+)
+
+(define-public (mark-arrived-on-scene (alert-id uint))
+    (let ((alert (unwrap! (map-get? emergency-alerts alert-id) ERR_ALERT_NOT_FOUND))
+          (response (unwrap! (map-get? alert-responses {alert-id: alert-id, responder: tx-sender}) ERR_ALERT_NOT_FOUND)))
+        (asserts! (is-some (map-get? members tx-sender)) ERR_NOT_MEMBER)
+        (asserts! (not (get resolved alert)) ERR_ALERT_RESOLVED)
+        
+        (map-set alert-responses {alert-id: alert-id, responder: tx-sender} (merge response {arrived-on-scene: true}))
+        (ok true)
+    )
+)
+
+(define-public (verify-emergency-alert (alert-id uint))
+    (let ((alert (unwrap! (map-get? emergency-alerts alert-id) ERR_ALERT_NOT_FOUND)))
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (not (get resolved alert)) ERR_ALERT_RESOLVED)
+        
+        (map-set emergency-alerts alert-id (merge alert {verified: true}))
+        (ok true)
+    )
+)
+
+(define-public (resolve-emergency-alert (alert-id uint))
+    (let ((alert (unwrap! (map-get? emergency-alerts alert-id) ERR_ALERT_NOT_FOUND)))
+        (asserts! (or (is-eq tx-sender CONTRACT_OWNER) (is-eq tx-sender (get creator alert))) ERR_UNAUTHORIZED)
+        (asserts! (not (get resolved alert)) ERR_ALERT_RESOLVED)
+        
+        (map-set emergency-alerts alert-id (merge alert {resolved: true}))
+        (ok true)
+    )
+)
+
+(define-public (escalate-alert-severity (alert-id uint) (new-severity uint))
+    (let ((alert (unwrap! (map-get? emergency-alerts alert-id) ERR_ALERT_NOT_FOUND)))
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (not (get resolved alert)) ERR_ALERT_RESOLVED)
+        (asserts! (and (>= new-severity u1) (<= new-severity u5)) ERR_INVALID_SEVERITY)
+        (asserts! (> new-severity (get severity alert)) ERR_INVALID_AMOUNT)
+        
+        (map-set emergency-alerts alert-id (merge alert {severity: new-severity}))
+        (ok true)
+    )
+)
+
+(define-public (add-safety-zone (zone-name (string-ascii 50)) (description (string-ascii 200)) (priority-level uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (and (>= priority-level u1) (<= priority-level u5)) ERR_INVALID_AMOUNT)
+        (asserts! (is-none (map-get? safety-zones zone-name)) ERR_ALREADY_MEMBER)
+        
+        (map-set safety-zones zone-name {
+            zone-name: zone-name,
+            description: description,
+            priority-level: priority-level,
+            active: true
+        })
+        (ok true)
+    )
+)
+
+(define-public (deactivate-safety-zone (zone-name (string-ascii 50)))
+    (let ((zone (unwrap! (map-get? safety-zones zone-name) ERR_INVALID_ZONE)))
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (map-set safety-zones zone-name (merge zone {active: false}))
+        (ok true)
+    )
+)
+
+(define-public (broadcast-zone-alert (zone (string-ascii 50)) (title (string-ascii 100)) (description (string-ascii 400)) (severity uint))
+    (let ((alert-id (+ (var-get alert-counter) u1))
+          (zone-info (unwrap! (map-get? safety-zones zone) ERR_INVALID_ZONE)))
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (and (>= severity u1) (<= severity u5)) ERR_INVALID_SEVERITY)
+        (asserts! (get active zone-info) ERR_INVALID_ZONE)
+        
+        (map-set emergency-alerts alert-id {
+            id: alert-id,
+            creator: tx-sender,
+            title: title,
+            description: description,
+            severity: severity,
+            zone: zone,
+            location: "ZONE-WIDE",
+            timestamp: stacks-block-height,
+            resolved: false,
+            responder-count: u0,
+            acknowledgment-count: u0,
+            verified: true
+        })
+        (var-set alert-counter alert-id)
+        (ok alert-id)
+    )
+)
+
+(define-read-only (get-emergency-alert (alert-id uint))
+    (map-get? emergency-alerts alert-id)
+)
+
+(define-read-only (get-alert-response (alert-id uint) (responder principal))
+    (map-get? alert-responses {alert-id: alert-id, responder: responder})
+)
+
+(define-read-only (get-alert-acknowledgment (alert-id uint) (member principal))
+    (map-get? alert-acknowledgments {alert-id: alert-id, member: member})
+)
+
+(define-read-only (get-safety-zone (zone-name (string-ascii 50)))
+    (map-get? safety-zones zone-name)
+)
+
+(define-read-only (get-alert-count)
+    (var-get alert-counter)
+)
+
+(define-read-only (get-active-alerts-by-severity (min-severity uint))
+    (let ((current-counter (var-get alert-counter)))
+        (fold check-alert-severity (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10) (list))
+    )
+)
+
+(define-private (check-alert-severity (alert-id uint) (acc (list 10 uint)))
+    (let ((alert (map-get? emergency-alerts alert-id)))
+        (if (and (is-some alert) 
+                 (not (get resolved (unwrap-panic alert)))
+                 (>= (get severity (unwrap-panic alert)) u3))
+            (unwrap-panic (as-max-len? (append acc alert-id) u10))
+            acc
+        )
+    )
+)
+
+(define-read-only (is-zone-emergency (zone (string-ascii 50)))
+    (let ((zone-info (map-get? safety-zones zone)))
+        (if (is-some zone-info)
+            (>= (get priority-level (unwrap-panic zone-info)) u4)
+            false
+        )
+    )
+)
+
+
