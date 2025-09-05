@@ -17,6 +17,11 @@
 (define-constant ERR_ALERT_RESOLVED (err u115))
 (define-constant ERR_INVALID_SEVERITY (err u116))
 (define-constant ERR_INVALID_ZONE (err u117))
+(define-constant ERR_SHIFT_CONFLICT (err u118))
+(define-constant ERR_SHIFT_NOT_FOUND (err u119))
+(define-constant ERR_ALREADY_CHECKED_IN (err u120))
+(define-constant ERR_NOT_CHECKED_IN (err u121))
+(define-constant ERR_SHIFT_NOT_STARTED (err u122))
 
 (define-data-var proposal-counter uint u0)
 (define-data-var total-treasury uint u0)
@@ -63,6 +68,10 @@
 
 (define-data-var equipment-counter uint u0)
 (define-data-var reputation-reward-pool uint u0)
+
+;; Patrol System - New Feature
+(define-data-var shift-counter uint u0)
+(define-data-var patrol-observation-counter uint u0)
 
 (define-map member-reputation principal uint)
 (define-map reputation-levels uint {
@@ -677,6 +686,221 @@
             false
         )
     )
+)
+
+;; PATROL SYSTEM - NEW FEATURE
+
+;; Patrol-specific maps
+(define-map patrol-shifts uint {
+    id: uint,
+    patroller: principal,
+    zone: (string-ascii 50),
+    start-time: uint,
+    end-time: uint,
+    status: uint,
+    check-in-time: (optional uint),
+    check-out-time: (optional uint),
+    observations-count: uint,
+    reputation-awarded: bool
+})
+
+(define-map patrol-observations uint {
+    id: uint,
+    shift-id: uint,
+    observer: principal,
+    location: (string-ascii 100),
+    observation-type: (string-ascii 50),
+    description: (string-ascii 300),
+    timestamp: uint,
+    severity: uint
+})
+
+(define-map member-patrol-stats principal {
+    total-shifts: uint,
+    completed-shifts: uint,
+    missed-shifts: uint,
+    total-hours: uint,
+    observations-made: uint,
+    last-patrol: uint
+})
+
+;; Schedule a patrol shift
+(define-public (schedule-patrol-shift (zone (string-ascii 50)) (start-time uint) (end-time uint))
+    (let ((shift-id (+ (var-get shift-counter) u1))
+          (current-block stacks-block-height))
+        (asserts! (> end-time start-time) ERR_INVALID_AMOUNT)
+        (asserts! (> start-time current-block) ERR_INVALID_AMOUNT)
+        (asserts! (<= (- end-time start-time) u144) ERR_INVALID_AMOUNT)
+        (asserts! (is-some (map-get? members tx-sender)) ERR_NOT_MEMBER)
+        (asserts! (not (has-shift-conflict tx-sender start-time end-time)) ERR_SHIFT_CONFLICT)
+        
+        (map-set patrol-shifts shift-id {
+            id: shift-id,
+            patroller: tx-sender,
+            zone: zone,
+            start-time: start-time,
+            end-time: end-time,
+            status: u1,
+            check-in-time: none,
+            check-out-time: none,
+            observations-count: u0,
+            reputation-awarded: false
+        })
+        
+        (var-set shift-counter shift-id)
+        (unwrap-panic (update-member-patrol-stats tx-sender u1 u0 u0 u0 u0))
+        (ok shift-id)
+    )
+)
+
+;; Check in to start patrol
+(define-public (check-in-patrol (shift-id uint))
+    (let ((shift (unwrap! (map-get? patrol-shifts shift-id) ERR_SHIFT_NOT_FOUND))
+          (current-block stacks-block-height))
+        (asserts! (is-eq (get patroller shift) tx-sender) ERR_UNAUTHORIZED)
+        (asserts! (is-eq (get status shift) u1) ERR_ALREADY_CHECKED_IN)
+        (asserts! (>= current-block (get start-time shift)) ERR_SHIFT_NOT_STARTED)
+        (asserts! (<= current-block (get end-time shift)) ERR_INVALID_AMOUNT)
+        
+        (map-set patrol-shifts shift-id (merge shift {
+            status: u2,
+            check-in-time: (some current-block)
+        }))
+        (ok true)
+    )
+)
+
+;; Check out to end patrol
+(define-public (check-out-patrol (shift-id uint))
+    (let ((shift (unwrap! (map-get? patrol-shifts shift-id) ERR_SHIFT_NOT_FOUND))
+          (current-block stacks-block-height)
+          (check-in-block (unwrap! (get check-in-time shift) ERR_NOT_CHECKED_IN))
+          (patrol-hours (/ (- current-block check-in-block) u6)))
+        
+        (asserts! (is-eq (get patroller shift) tx-sender) ERR_UNAUTHORIZED)
+        (asserts! (is-eq (get status shift) u2) ERR_NOT_CHECKED_IN)
+        
+        (map-set patrol-shifts shift-id (merge shift {
+            status: u3,
+            check-out-time: (some current-block)
+        }))
+        
+        (unwrap-panic (update-member-patrol-stats tx-sender u0 u1 u0 patrol-hours u0))
+        (unwrap-panic (award-patrol-reputation shift-id patrol-hours))
+        (ok true)
+    )
+)
+
+;; Submit observation during patrol
+(define-public (submit-patrol-observation (shift-id uint) (location (string-ascii 100)) 
+                                        (observation-type (string-ascii 50)) (description (string-ascii 300)) 
+                                        (severity uint))
+    (let ((shift (unwrap! (map-get? patrol-shifts shift-id) ERR_SHIFT_NOT_FOUND))
+          (obs-id (+ (var-get patrol-observation-counter) u1)))
+        
+        (asserts! (is-eq (get patroller shift) tx-sender) ERR_UNAUTHORIZED)
+        (asserts! (is-eq (get status shift) u2) ERR_NOT_CHECKED_IN)
+        (asserts! (and (>= severity u1) (<= severity u3)) ERR_INVALID_AMOUNT)
+        
+        (map-set patrol-observations obs-id {
+            id: obs-id,
+            shift-id: shift-id,
+            observer: tx-sender,
+            location: location,
+            observation-type: observation-type,
+            description: description,
+            timestamp: stacks-block-height,
+            severity: severity
+        })
+        
+        (map-set patrol-shifts shift-id (merge shift {
+            observations-count: (+ (get observations-count shift) u1)
+        }))
+        
+        (var-set patrol-observation-counter obs-id)
+        (unwrap-panic (update-member-patrol-stats tx-sender u0 u0 u0 u0 u1))
+        (ok obs-id)
+    )
+)
+
+;; Private functions for patrol system
+
+(define-private (has-shift-conflict (patroller principal) (start-time uint) (end-time uint))
+    (get conflict (fold check-single-shift-conflict 
+          (list u1 u2 u3 u4 u5)
+          {patroller: patroller, start: start-time, end: end-time, conflict: false}))
+)
+
+(define-private (check-single-shift-conflict (shift-id uint) 
+                                           (params {patroller: principal, start: uint, end: uint, conflict: bool}))
+    (let ((shift (map-get? patrol-shifts shift-id)))
+        (if (and (is-some shift)
+                 (is-eq (get patroller (unwrap-panic shift)) (get patroller params))
+                 (not (is-eq (get status (unwrap-panic shift)) u3))
+                 (not (is-eq (get status (unwrap-panic shift)) u4)))
+            (if (or (and (>= (get start params) (get start-time (unwrap-panic shift)))
+                         (< (get start params) (get end-time (unwrap-panic shift))))
+                    (and (> (get end params) (get start-time (unwrap-panic shift)))
+                         (<= (get end params) (get end-time (unwrap-panic shift)))))
+                (merge params {conflict: true})
+                params)
+            params)
+    )
+)
+
+(define-private (update-member-patrol-stats (member principal) (total-inc uint) (completed-inc uint) 
+                                          (missed-inc uint) (hours-inc uint) (obs-inc uint))
+    (let ((current-stats (default-to {total-shifts: u0, completed-shifts: u0, missed-shifts: u0, 
+                                      total-hours: u0, observations-made: u0, last-patrol: u0} 
+                                     (map-get? member-patrol-stats member))))
+        (map-set member-patrol-stats member {
+            total-shifts: (+ (get total-shifts current-stats) total-inc),
+            completed-shifts: (+ (get completed-shifts current-stats) completed-inc),
+            missed-shifts: (+ (get missed-shifts current-stats) missed-inc),
+            total-hours: (+ (get total-hours current-stats) hours-inc),
+            observations-made: (+ (get observations-made current-stats) obs-inc),
+            last-patrol: (if (> completed-inc u0) stacks-block-height (get last-patrol current-stats))
+        })
+        (ok true)
+    )
+)
+
+(define-private (award-patrol-reputation (shift-id uint) (patrol-hours uint))
+    (let ((shift (unwrap! (map-get? patrol-shifts shift-id) ERR_SHIFT_NOT_FOUND))
+          (base-reward u30)
+          (hour-bonus (* patrol-hours u5))
+          (observation-bonus (* (get observations-count shift) u10))
+          (total-reward (+ base-reward (+ hour-bonus observation-bonus))))
+        
+        (map-set patrol-shifts shift-id (merge shift {reputation-awarded: true}))
+        (map-set member-reputation (get patroller shift) (+ (default-to u0 (map-get? member-reputation (get patroller shift))) total-reward))
+        (ok total-reward)
+    )
+)
+
+;; Read-only functions for patrol system
+(define-read-only (get-patrol-shift (shift-id uint))
+    (map-get? patrol-shifts shift-id)
+)
+
+(define-read-only (get-patrol-observation (obs-id uint))
+    (map-get? patrol-observations obs-id)
+)
+
+(define-read-only (get-member-patrol-stats (member principal))
+    (map-get? member-patrol-stats member)
+)
+
+(define-read-only (get-shift-count)
+    (var-get shift-counter)
+)
+
+(define-read-only (get-patrol-observation-count)
+    (var-get patrol-observation-counter)
+)
+
+(define-read-only (is-patroller-available (patroller principal) (start-time uint) (end-time uint))
+    (not (has-shift-conflict patroller start-time end-time))
 )
 
 
